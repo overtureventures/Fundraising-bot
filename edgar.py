@@ -249,6 +249,12 @@ def parse_stockholders(filing: Dict) -> List[Dict]:
         logger.warning(f'Could not resolve document URL for {filing["company_name"]}')
         return []
 
+    # Strip the inline XBRL viewer wrapper if present.
+    # URLs like https://www.sec.gov/ix?doc=/Archives/... serve the viewer shell,
+    # not the actual document. Unwrap to get the raw HTML.
+    if '/ix?doc=' in doc_url:
+        doc_url = 'https://www.sec.gov' + doc_url.split('/ix?doc=')[1]
+
     logger.info(f'Fetching S-1 document: {doc_url}')
     try:
         response = requests.get(doc_url, headers=SEC_HEADERS, timeout=60)
@@ -327,15 +333,18 @@ def is_valid_investor_name(name: str) -> bool:
     bad_starts = [
         'name', 'total', '(', '_', '*', '-', '\u2014', 'note', 'see ',
         'the ', 'our ', 'we ', 'an ', 'a ', 'all executive', 'all directors',
-        'officers and directors as a group', 'executive officers and directors',
+        'all director', 'officers and directors as a group',
+        'executive officers and directors',
+        'directors and executive officers as a group',
+        'selling shareholders', 'other 5%', 'other shareholders',
         'item', 'part', 'section', 'article', 'exhibit', 'schedule',
         'index', 'table', 'summary', 'overview', 'introduction',
         'directors and', 'executive officers',
     ]
     for start in bad_starts:
         if name_lower.startswith(start):
-            if 'as a group' in name_lower and any(c.isdigit() for c in name):
-                return True
+            # Exception: "all executive officers as a group (N persons)" with a digit IS valid
+            # as an aggregate row we might want — but the instructions say skip it, so always reject
             return False
 
     if re.match(r'^[\d\s\.\,\%\$\(\)\-]+$', name):
