@@ -1,7 +1,10 @@
 """
 SEC EDGAR API integration for fetching and parsing S-1 filings.
+Uses the EFTS full-text search API with date range filtering and
+constructs document URLs from the submissions JSON rather than scraping.
 """
 
+import os
 import re
 import requests
 from datetime import datetime, timedelta
@@ -11,225 +14,285 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# SEC requires a User-Agent header with contact info
+# Read from env so Railway can set a real contact email
+_user_agent_email = os.getenv('SEC_USER_AGENT_EMAIL', 'contact@yourfirm.com')
 SEC_HEADERS = {
-    'User-Agent': 'S1Prospector/1.0 (contact@yourfirm.com)',  # Update with your info
+    'User-Agent': f'S1Prospector/1.0 ({_user_agent_email})',
     'Accept-Encoding': 'gzip, deflate'
 }
 
-EDGAR_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
-EDGAR_SUBMISSIONS_URL = "https://data.sec.gov/submissions"
-EDGAR_FILINGS_URL = "https://www.sec.gov/cgi-bin/browse-edgar"
+EDGAR_SUBMISSIONS_URL = 'https://data.sec.gov/submissions'
+EDGAR_ARCHIVES_URL = 'https://www.sec.gov/Archives/edgar/data'
+EFTS_SEARCH_URL = 'https://efts.sec.gov/LATEST/search-index'
 
 
 def get_recent_s1_filings(days_back: int = 7) -> List[Dict]:
     """
-    Fetch S-1 and S-1/A filings from the last N days.
-    
-    Returns list of filing metadata dicts.
+    Fetch S-1 and S-1/A filings from the last N days using the EFTS
+    full-text search API with explicit date range parameters.
+    Falls back to the RSS feed if EFTS returns nothing.
     """
-    filings = []
-    
-    # Calculate date range
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days_back)
-    
-    # Use EDGAR full-text search API
-    search_url = "https://efts.sec.gov/LATEST/search-index"
-    
-    # Alternative: Use the EDGAR filing search
-    params = {
-        'action': 'getcompany',
-        'type': 'S-1',
-        'dateb': '',
-        'owner': 'include',
-        'count': 100,
-        'output': 'atom'
-    }
-    
-    try:
-        # Use the RSS feed for recent filings
-        rss_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=S-1&company=&dateb=&owner=include&count=100&output=atom"
-        response = requests.get(rss_url, headers=SEC_HEADERS, timeout=30)
-        response.raise_for_status()
-        
-        # Parse the Atom feed
-        soup = BeautifulSoup(response.content, 'xml')
-        entries = soup.find_all('entry')
-        
-        for entry in entries:
-            # Extract filing info
-            title = entry.find('title').text if entry.find('title') else ''
-            updated = entry.find('updated').text if entry.find('updated') else ''
-            link = entry.find('link')['href'] if entry.find('link') else ''
-            
-            # Parse the title to extract form type and company
-            # Format: "S-1 - Company Name (0001234567) (Filer)"
-            title_match = re.match(r'(S-1(?:/A)?) - (.+?) \((\d+)\)', title)
-            
-            if title_match:
-                form_type = title_match.group(1)
-                company_name = title_match.group(2).strip()
-                cik = title_match.group(3)
-                
-                # Parse the date
-                try:
-                    filing_date = datetime.fromisoformat(updated.replace('Z', '+00:00'))
-                except:
-                    filing_date = datetime.now()
-                
-                # Check if within our date range
-                if filing_date.replace(tzinfo=None) >= start_date:
-                    filings.append({
-                        'form_type': form_type,
-                        'company_name': company_name,
-                        'cik': cik,
-                        'filing_date': filing_date.strftime('%Y-%m-%d'),
-                        'filing_url': link
-                    })
-        
-        logger.info(f"Found {len(filings)} S-1 filings in date range")
-        
-    except requests.RequestException as e:
-        logger.error(f"Error fetching EDGAR filings: {e}")
-    
+
+    start_str = start_date.strftime('%Y-%m-%d')
+    end_str = end_date.strftime('%Y-%m-%d')
+
+    filings = _fetch_via_efts(start_str, end_str)
+    if not filings:
+        logger.warning('EFTS returned no results, falling back to RSS feed')
+        filings = _fetch_via_rss(start_date)
+
+    logger.info(f'Found {len(filings)} S-1 filings between {start_str} and {end_str}')
     return filings
 
 
-def get_filing_document_url(cik: str, accession_number: str) -> Optional[str]:
-    """Get the URL to the main S-1 document."""
-    # Format accession number for URL
-    acc_formatted = accession_number.replace('-', '')
-    
-    # Get filing index
-    index_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_formatted}/index.json"
-    
+def _fetch_via_efts(start_str: str, end_str: str) -> List[Dict]:
+    """Query the EFTS search API with a date range."""
+    filings = []
+    try:
+        params = {
+            'forms': 'S-1,S-1/A',
+            'dateRange': 'custom',
+            'startdt': start_str,
+            'enddt': end_str,
+            'hits.hits.total.value': 1,
+            'hits.hits._source.period_of_report': 1,
+        }
+        response = requests.get(EFTS_SEARCH_URL, params=params, headers=SEC_HEADERS, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        hits = data.get('hits', {}).get('hits', [])
+        for hit in hits:
+            source = hit.get('_source', {})
+
+            # EFTS native API field names (efts.sec.gov)
+            # entity_name, file_date, period_of_report, form_type, file_num
+            # display_names is an array of "Name (CIK)" strings
+            display_names = source.get('display_names', [])
+            entity_name = source.get('entity_name', '')
+            if not entity_name and display_names:
+                # display_names entries look like "Acme Corp (0001234567) (CIK)"
+                entity_name = display_names[0].split('(')[0].strip()
+
+            form_type = source.get('form_type', 'S-1')
+            file_date = source.get('file_date', '')
+
+            # Extract CIK from display_names if not directly available
+            cik_raw = source.get('entity_id', '')
+            if not cik_raw and display_names:
+                cik_match = re.search(r'\((\d{10})\)', display_names[0])
+                if cik_match:
+                    cik_raw = cik_match.group(1)
+
+            # _id is the accession number with dashes e.g. 0001193125-24-012345
+            accession_dashed = hit.get('_id', '')
+            accession_clean = accession_dashed.replace('-', '')
+
+            if not cik_raw or not accession_clean:
+                continue
+
+            cik_stripped = str(cik_raw).lstrip('0')
+            cik_padded = str(cik_raw).zfill(10)
+
+            filings.append({
+                'form_type': form_type,
+                'company_name': entity_name.strip(),
+                'cik': cik_stripped,
+                'cik_padded': cik_padded,
+                'accession_clean': accession_clean,
+                'filing_date': file_date,
+                # Direct link to the filing index
+                'filing_url': (
+                    f'https://www.sec.gov/cgi-bin/browse-edgar'
+                    f'?action=getcompany&CIK={cik_stripped}&type=S-1&dateb=&owner=include&count=10'
+                ),
+            })
+
+    except requests.RequestException as e:
+        logger.error(f'EFTS query failed: {e}')
+
+    return filings
+
+
+def _fetch_via_rss(start_date: datetime) -> List[Dict]:
+    """
+    Fallback: parse the EDGAR RSS feed and filter by date client-side.
+    The feed returns the most recent 100 S-1s regardless of date.
+    """
+    filings = []
+    try:
+        rss_url = (
+            'https://www.sec.gov/cgi-bin/browse-edgar'
+            '?action=getcurrent&type=S-1&company=&dateb=&owner=include&count=100&output=atom'
+        )
+        response = requests.get(rss_url, headers=SEC_HEADERS, timeout=30)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, 'xml')
+        for entry in soup.find_all('entry'):
+            title_tag = entry.find('title')
+            updated_tag = entry.find('updated')
+            link_tag = entry.find('link')
+
+            if not title_tag or not updated_tag:
+                continue
+
+            title = title_tag.text
+            link = link_tag['href'] if link_tag else ''
+
+            match = re.match(r'(S-1(?:/A)?) - (.+?) \((\d+)\)', title)
+            if not match:
+                continue
+
+            form_type = match.group(1)
+            company_name = match.group(2).strip()
+            cik = match.group(3)
+
+            try:
+                filing_date = datetime.fromisoformat(updated_tag.text.replace('Z', '+00:00'))
+            except ValueError:
+                filing_date = datetime.now()
+
+            if filing_date.replace(tzinfo=None) < start_date:
+                continue
+
+            filings.append({
+                'form_type': form_type,
+                'company_name': company_name,
+                'cik': cik.lstrip('0'),
+                'cik_padded': cik.zfill(10),
+                'accession_clean': '',  # not available from RSS directly
+                'filing_date': filing_date.strftime('%Y-%m-%d'),
+                'filing_url': link,
+            })
+
+    except requests.RequestException as e:
+        logger.error(f'RSS fallback failed: {e}')
+
+    return filings
+
+
+def get_accession_number(cik_padded: str, form_type: str = 'S-1') -> Optional[str]:
+    """
+    Fetch the most recent S-1 accession number for a company from the
+    submissions JSON. Returns the accession number without dashes.
+    """
+    url = f'{EDGAR_SUBMISSIONS_URL}/CIK{cik_padded}.json'
+    try:
+        response = requests.get(url, headers=SEC_HEADERS, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        recent = data.get('filings', {}).get('recent', {})
+        forms = recent.get('form', [])
+        accessions = recent.get('accessionNumber', [])
+
+        for form, accession in zip(forms, accessions):
+            if form in ('S-1', 'S-1/A'):
+                return accession.replace('-', '')
+
+    except requests.RequestException as e:
+        logger.error(f'Error fetching submissions for CIK {cik_padded}: {e}')
+
+    return None
+
+
+def get_s1_document_url(cik: str, cik_padded: str, accession_clean: str) -> Optional[str]:
+    """
+    Build the URL to the primary S-1 HTML document using the filing index JSON.
+    This is deterministic and does not require HTML scraping.
+    """
+    if not accession_clean:
+        accession_clean = get_accession_number(cik_padded)
+    if not accession_clean:
+        logger.warning(f'No accession number found for CIK {cik}')
+        return None
+
+    index_url = f'{EDGAR_ARCHIVES_URL}/{cik}/{accession_clean}/index.json'
     try:
         response = requests.get(index_url, headers=SEC_HEADERS, timeout=30)
         response.raise_for_status()
         index_data = response.json()
-        
-        # Find the main S-1 document (usually .htm)
-        for item in index_data.get('directory', {}).get('item', []):
-            name = item.get('name', '')
-            if name.endswith('.htm') and 's-1' in name.lower():
-                return f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_formatted}/{name}"
-        
-        # Fallback: just get the first .htm file
-        for item in index_data.get('directory', {}).get('item', []):
+
+        items = index_data.get('directory', {}).get('item', [])
+
+        # Prefer a file whose name contains 's-1' or 'prospectus'
+        for item in items:
+            name = item.get('name', '').lower()
+            if name.endswith('.htm') and ('s-1' in name or 'prospectus' in name):
+                return f'{EDGAR_ARCHIVES_URL}/{cik}/{accession_clean}/{item["name"]}'
+
+        # Fallback: first .htm file
+        for item in items:
             if item.get('name', '').endswith('.htm'):
-                return f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_formatted}/{item['name']}"
-                
+                return f'{EDGAR_ARCHIVES_URL}/{cik}/{accession_clean}/{item["name"]}'
+
     except requests.RequestException as e:
-        logger.error(f"Error getting filing document URL: {e}")
-    
+        logger.error(f'Error fetching index for {cik}/{accession_clean}: {e}')
+
     return None
 
 
 def parse_stockholders(filing: Dict) -> List[Dict]:
     """
-    Parse the principal stockholders table from an S-1 filing.
-    
-    This is the trickiest part - S-1 formats vary significantly.
-    We look for common section headers and table patterns.
+    Fetch the S-1 document and extract the principal stockholders table.
+    Uses the index JSON to find the correct document URL rather than scraping links.
     """
-    stockholders = []
-    
-    filing_url = filing.get('filing_url', '')
-    if not filing_url:
-        return stockholders
-    
+    cik = filing.get('cik', '')
+    cik_padded = filing.get('cik_padded', cik.zfill(10))
+    accession_clean = filing.get('accession_clean', '')
+
+    doc_url = get_s1_document_url(cik, cik_padded, accession_clean)
+    if not doc_url:
+        logger.warning(f'Could not resolve document URL for {filing["company_name"]}')
+        return []
+
+    logger.info(f'Fetching S-1 document: {doc_url}')
     try:
-        # First, get the filing index page to find the actual document
-        response = requests.get(filing_url, headers=SEC_HEADERS, timeout=30)
+        response = requests.get(doc_url, headers=SEC_HEADERS, timeout=60)
         response.raise_for_status()
-        
-        # Parse the index page to find the S-1 document link
-        soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Look for the main document link
-        doc_link = None
-        for link in soup.find_all('a'):
-            href = link.get('href', '')
-            text = link.get_text().lower()
-            if 's-1' in text or href.endswith('.htm'):
-                if '/Archives/edgar/data/' in href:
-                    doc_link = 'https://www.sec.gov' + href if href.startswith('/') else href
-                    break
-        
-        if not doc_link:
-            # Try to construct from the index page URL
-            table = soup.find('table', {'class': 'tableFile'})
-            if table:
-                for row in table.find_all('tr'):
-                    cells = row.find_all('td')
-                    if len(cells) >= 3:
-                        doc_type = cells[3].get_text().strip() if len(cells) > 3 else ''
-                        if 'S-1' in doc_type or cells[0].find('a'):
-                            link = cells[2].find('a') if len(cells) > 2 else cells[0].find('a')
-                            if link:
-                                href = link.get('href', '')
-                                doc_link = 'https://www.sec.gov' + href if href.startswith('/') else href
-                                break
-        
-        if not doc_link:
-            logger.warning(f"Could not find S-1 document link for {filing['company_name']}")
-            return stockholders
-        
-        # Now fetch the actual S-1 document
-        logger.info(f"Fetching S-1 document: {doc_link}")
-        doc_response = requests.get(doc_link, headers=SEC_HEADERS, timeout=60)
-        doc_response.raise_for_status()
-        
-        doc_soup = BeautifulSoup(doc_response.content, 'html.parser')
-        
-        # Find the stockholders section
-        stockholders = extract_stockholder_table(doc_soup)
-        
-        logger.info(f"Extracted {len(stockholders)} stockholders from {filing['company_name']}")
-        
     except requests.RequestException as e:
-        logger.error(f"Error parsing stockholders from {filing['company_name']}: {e}")
-    
+        logger.error(f'Failed to fetch S-1 for {filing["company_name"]}: {e}')
+        return []
+
+    doc_soup = BeautifulSoup(response.content, 'html.parser')
+    stockholders = extract_stockholder_table(doc_soup)
+    logger.info(f'Extracted {len(stockholders)} stockholders from {filing["company_name"]}')
     return stockholders
 
 
 def is_valid_investor_name(name: str) -> bool:
     """
-    Check if a string looks like a valid investor name vs a section header.
-    Returns True if it looks like a real investor name.
+    Return True if the string looks like a real investor name rather than
+    a section header, table caption, or other non-name content.
     """
     name_lower = name.lower().strip()
     name_upper = name.upper().strip()
-    
-    # Skip if too short or too long
+
     if len(name) < 3 or len(name) > 150:
         return False
-    
-    # If entire name is uppercase and more than 3 words, likely a section header
+
     words = name.split()
     if name == name_upper and len(words) > 4:
         return False
-    
-    # Exact matches to reject
+
     exact_rejects = [
         'directors and executive officers',
-        'executive officers and directors', 
+        'executive officers and directors',
         'principal shareholders',
         'common stock',
         'class a common stock',
         'class b common stock',
         'preferred stock',
     ]
-    # Check with percentage stripped
     name_no_pct = re.sub(r'\s*\([\d\.]+%\)\s*', '', name_lower).strip()
     name_no_pct = re.sub(r'\s*\(more than \d+%\).*', '', name_no_pct).strip()
     name_no_pct = name_no_pct.rstrip(':')
-    
     if name_no_pct in exact_rejects:
         return False
-    
-    # Section headers to filter out (case-insensitive)
+
     section_headers = [
         'use of proceeds', 'plan of distribution', 'risk factors',
         'legal matters', 'experts', 'underwriting', 'indemnification',
@@ -257,14 +320,12 @@ def is_valid_investor_name(name: str) -> bool:
         'principal shareholders', 'more than 5%', 'class a', 'class b',
         'common stock', 'preferred stock', 'series a', 'series b',
     ]
-    
     for header in section_headers:
         if header in name_lower:
             return False
-    
-    # Skip if starts with common non-name patterns
+
     bad_starts = [
-        'name', 'total', '(', '_', '*', '-', '—', 'note', 'see ',
+        'name', 'total', '(', '_', '*', '-', '\u2014', 'note', 'see ',
         'the ', 'our ', 'we ', 'an ', 'a ', 'all executive', 'all directors',
         'officers and directors as a group', 'executive officers and directors',
         'item', 'part', 'section', 'article', 'exhibit', 'schedule',
@@ -273,29 +334,21 @@ def is_valid_investor_name(name: str) -> bool:
     ]
     for start in bad_starts:
         if name_lower.startswith(start):
-            # Exception: "All executive officers..." with share data is valid
             if 'as a group' in name_lower and any(c.isdigit() for c in name):
                 return True
             return False
-    
-    # Skip if it's just numbers or special characters
+
     if re.match(r'^[\d\s\.\,\%\$\(\)\-]+$', name):
         return False
-    
-    # Skip if it looks like a footnote
     if re.match(r'^\(\d+\)', name) or re.match(r'^\*+', name):
         return False
-    
-    # Skip if it ends with common section endings
-    bad_endings = ['statements', 'information', 'considerations', 'matters', 
+
+    bad_endings = ['statements', 'information', 'considerations', 'matters',
                    'disclosure', 'liability', 'liabilities']
     for ending in bad_endings:
         if name_lower.endswith(ending):
             return False
-    
-    # Valid investor names usually contain:
-    # - Person names (capitalized words, 2-5 words)
-    # - Entity names (LLC, LP, Inc, Corp, Fund, Capital, Partners, Trust, etc.)
+
     entity_indicators = [
         'llc', 'llp', 'l.l.c', 'l.p.', ' lp', 'inc', 'corp', 'corporation',
         'fund', 'capital', 'partners', 'venture', 'trust', 'holdings',
@@ -304,145 +357,107 @@ def is_valid_investor_name(name: str) -> bool:
         'securities', 'limited', 'ltd', 'company', 'co.', ' gp',
         'partnership',
     ]
-    
-    # Check if it looks like an entity
     has_entity_indicator = any(ind in name_lower for ind in entity_indicators)
-    
-    # Check if it looks like a person name (2-5 capitalized words, not all caps)
+
     capitalized_words = sum(1 for w in words if w and w[0].isupper() and not w.isupper())
     looks_like_person = 2 <= len(words) <= 5 and capitalized_words >= 2 and name != name_upper
-    
-    # Check if it has credentials (Ph.D., M.D., M.B.A., etc.) - indicates a person
+
     has_credentials = bool(re.search(r'\b(Ph\.?D|M\.?D|M\.?B\.?A|J\.?D|CPA|CFA)\b', name, re.I))
-    
-    # If it has ownership percentage embedded, probably valid
+
     if re.search(r'\d+\.?\d*%', name):
-        # But make sure it's not just a percentage phrase
         if has_entity_indicator or looks_like_person or has_credentials:
             return True
-    
-    # Must look like either an entity or a person
+
     if has_entity_indicator or looks_like_person or has_credentials:
         return True
-    
-    # Last resort: if short (2-3 words) and has a capitalized structure, might be a name
-    if len(words) >= 2 and len(words) <= 4:
-        # Check if it looks like "First Last" pattern
-        if all(w[0].isupper() for w in words if w):
-            return True
-    
+
+    if 2 <= len(words) <= 4 and all(w[0].isupper() for w in words if w):
+        return True
+
     return False
 
 
 def extract_stockholder_table(soup: BeautifulSoup) -> List[Dict]:
     """
-    Extract stockholder information from the parsed S-1 document.
-    
-    Looks for sections titled:
-    - "Principal Stockholders"
-    - "Principal and Selling Stockholders"
-    - "Security Ownership of Certain Beneficial Owners"
-    - "Beneficial Ownership"
+    Find and parse the principal stockholders table from a parsed S-1 document.
     """
     stockholders = []
-    
-    # Common section header patterns
+
     header_patterns = [
         r'principal\s+(and\s+selling\s+)?stockholders',
         r'security\s+ownership',
         r'beneficial\s+owner',
         r'selling\s+stockholders',
-        r'principal\s+shareholders'
+        r'principal\s+shareholders',
     ]
-    
-    # Find tables that might contain stockholder data
+
     tables = soup.find_all('table')
-    
+
     for table in tables:
-        # Check if this table or nearby text contains stockholder-related headers
         table_text = table.get_text().lower()
         preceding_text = ''
-        
-        # Get preceding siblings/parents to check for section header
+
         for prev in table.find_all_previous(limit=5):
             if prev.name in ['h1', 'h2', 'h3', 'h4', 'p', 'div', 'b', 'strong']:
                 preceding_text = prev.get_text().lower()
                 break
-        
+
         is_stockholder_table = False
         for pattern in header_patterns:
             if re.search(pattern, table_text) or re.search(pattern, preceding_text):
                 is_stockholder_table = True
                 break
-        
-        # Also check for column headers that indicate stockholder tables
+
         if 'beneficial' in table_text and ('shares' in table_text or 'percent' in table_text):
             is_stockholder_table = True
-        
-        if is_stockholder_table:
-            rows = table.find_all('tr')
-            
-            # Try to identify header row and data rows
-            header_row_idx = None
-            for idx, row in enumerate(rows):
-                row_text = row.get_text().lower()
-                if ('name' in row_text and ('shares' in row_text or 'percent' in row_text)) or \
-                   ('beneficial owner' in row_text):
-                    header_row_idx = idx
-                    break
-            
-            if header_row_idx is not None:
-                # Parse data rows
-                for row in rows[header_row_idx + 1:]:
-                    cells = row.find_all(['td', 'th'])
-                    if len(cells) >= 2:
-                        name_cell = cells[0].get_text().strip()
-                        
-                        # Clean up the name
-                        name = re.sub(r'\s+', ' ', name_cell)
-                        name = re.sub(r'\(\d+\)', '', name)  # Remove footnote references like (1), (2)
-                        name = re.sub(r'\([a-z]\)', '', name, flags=re.I)  # Remove (a), (b), etc.
-                        name = name.strip()
-                        
-                        # Validate that this looks like a real investor name
-                        if not is_valid_investor_name(name):
-                            continue
-                        
-                        stockholder = {'name': name}
-                        
-                        # Try to extract shares and percentage from other cells
-                        for cell in cells[1:]:
-                            cell_text = cell.get_text().strip()
-                            
-                            # Look for percentage
-                            pct_match = re.search(r'(\d+\.?\d*)%', cell_text)
-                            if pct_match and 'ownership_pct' not in stockholder:
-                                stockholder['ownership_pct'] = pct_match.group(1)
-                            
-                            # Look for share count
-                            share_match = re.search(r'([\d,]+)', cell_text.replace('%', ''))
-                            if share_match and 'shares' not in stockholder:
-                                shares = share_match.group(1).replace(',', '')
-                                if shares.isdigit() and int(shares) > 100:
-                                    stockholder['shares'] = shares
-                        
-                        stockholders.append(stockholder)
-            
-            # Only process one stockholder table
-            if stockholders:
+
+        if not is_stockholder_table:
+            continue
+
+        rows = table.find_all('tr')
+        header_row_idx = None
+        for idx, row in enumerate(rows):
+            row_text = row.get_text().lower()
+            if ('name' in row_text and ('shares' in row_text or 'percent' in row_text)) or \
+               ('beneficial owner' in row_text):
+                header_row_idx = idx
                 break
-    
+
+        if header_row_idx is None:
+            continue
+
+        for row in rows[header_row_idx + 1:]:
+            cells = row.find_all(['td', 'th'])
+            if len(cells) < 2:
+                continue
+
+            name_cell = cells[0].get_text().strip()
+            name = re.sub(r'\s+', ' ', name_cell)
+            name = re.sub(r'\(\d+\)', '', name)
+            name = re.sub(r'\([a-z]\)', '', name, flags=re.I)
+            name = name.strip()
+
+            if not is_valid_investor_name(name):
+                continue
+
+            stockholder = {'name': name}
+
+            for cell in cells[1:]:
+                cell_text = cell.get_text().strip()
+
+                pct_match = re.search(r'(\d+\.?\d*)%', cell_text)
+                if pct_match and 'ownership_pct' not in stockholder:
+                    stockholder['ownership_pct'] = pct_match.group(1)
+
+                share_match = re.search(r'([\d,]+)', cell_text.replace('%', ''))
+                if share_match and 'shares' not in stockholder:
+                    shares = share_match.group(1).replace(',', '')
+                    if shares.isdigit() and int(shares) > 100:
+                        stockholder['shares'] = shares
+
+            stockholders.append(stockholder)
+
+        if stockholders:
+            break
+
     return stockholders
-
-
-def get_filing_details(cik: str) -> Dict:
-    """Get detailed company filing information."""
-    url = f"{EDGAR_SUBMISSIONS_URL}/CIK{cik.zfill(10)}.json"
-    
-    try:
-        response = requests.get(url, headers=SEC_HEADERS, timeout=30)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        logger.error(f"Error fetching company details for CIK {cik}: {e}")
-        return {}
