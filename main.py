@@ -1,7 +1,7 @@
 """
-S-1 Prospector - Simplified Version
-Scans SEC EDGAR for recent S-1 filings, extracts investor data,
-enriches with foundation 990s, and outputs to console/CSV.
+S-1 Prospector
+Scans SEC EDGAR for recent S-1 filings, extracts principal stockholders,
+matches against Affinity CRM, and outputs to console and CSV.
 """
 
 import os
@@ -11,9 +11,9 @@ from dotenv import load_dotenv
 
 from edgar import get_recent_s1_filings, parse_stockholders
 from propublica import lookup_foundation_officers
+from affinity import AffinityClient
 from output import write_to_csv
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -24,215 +24,228 @@ load_dotenv()
 
 
 def classify_entity(name: str) -> str:
-    """Simple heuristic to classify investor entity type."""
     name_lower = name.lower()
-    
-    if any(term in name_lower for term in ['foundation', 'endowment']):
+    if any(t in name_lower for t in ['foundation', 'endowment']):
         return 'foundation'
-    elif any(term in name_lower for term in ['family office', 'family trust', 'family lp']):
+    if any(t in name_lower for t in ['family office', 'family trust', 'family lp']):
         return 'family_office'
-    elif any(term in name_lower for term in ['trust', 'estate']):
+    if any(t in name_lower for t in ['trust', 'estate']):
         return 'trust'
-    elif any(term in name_lower for term in ['capital', 'partners', 'ventures', 'fund', 'management', 'advisors', 'llc', 'lp']):
+    if any(t in name_lower for t in ['capital', 'partners', 'ventures', 'fund',
+                                      'management', 'advisors', 'llc', 'lp']):
         return 'fund'
-    elif any(term in name_lower for term in ['inc', 'corp', 'corporation', 'company']):
+    if any(t in name_lower for t in ['inc', 'corp', 'corporation', 'company']):
         return 'corporate'
-    else:
-        return 'unknown'
+    return 'unknown'
 
 
 def generate_linkedin_search_url(name: str) -> str:
-    """Generate a LinkedIn search URL for the entity."""
-    encoded_name = name.replace(' ', '%20')
-    return f"https://www.linkedin.com/search/results/companies/?keywords={encoded_name}"
+    encoded = name.replace(' ', '%20')
+    return f'https://www.linkedin.com/search/results/companies/?keywords={encoded}'
 
 
-def print_results_to_console(investors, run_date):
+def load_affinity_client() -> AffinityClient | None:
     """
-    Print investor results in a copyable format to Railway logs.
+    Instantiate and load the Affinity client if an API key is configured.
+    Returns None if the key is missing so the run can continue without CRM matching.
     """
-    print("\n\n")
-    print("=" * 100)
-    print("📋 WEEKLY S-1 INVESTOR REPORT - " + run_date)
-    print("=" * 100)
-    print()
-    
+    api_key = os.getenv('AFFINITY_API_KEY', '')
+    if not api_key:
+        logger.warning('AFFINITY_API_KEY not set. CRM matching will be skipped.')
+        return None
+
+    list_name = os.getenv('AFFINITY_LIST_NAME', 'Fundraising')
+    client = AffinityClient(api_key)
+
+    try:
+        client.load_fundraising_list(list_name)
+        logger.info(f'Affinity list "{list_name}" loaded successfully')
+    except Exception as e:
+        logger.error(f'Failed to load Affinity list: {e}')
+        return None
+
+    return client
+
+
+def enrich_with_crm(investor: dict, client: AffinityClient | None) -> dict:
+    """
+    Look up the investor in Affinity and populate CRM fields.
+    Safe to call with client=None (returns unchanged investor).
+    """
+    if client is None:
+        return investor
+
+    match = client.find_match(investor['investor_name'])
+    if match:
+        investor['in_crm'] = True
+        investor['crm_status'] = match.get('status', '')
+        investor['crm_last_activity'] = match.get('last_activity', '')
+        investor['crm_notes'] = match.get('notes', '')
+
+    return investor
+
+
+def print_results_to_console(investors: list, run_date: str):
+    print('\n\n')
+    print('=' * 100)
+    print(f'WEEKLY S-1 INVESTOR REPORT   {run_date}')
+    print('=' * 100)
+
     if not investors:
-        print("   No investors found this week.")
-        print("=" * 100)
+        print('   No investors found this week.')
+        print('=' * 100)
         return
-    
-    # Group by company
-    by_company = {}
+
+    by_company: dict[str, list] = {}
     for inv in investors:
-        company = inv['company_ipo']
-        if company not in by_company:
-            by_company[company] = []
-        by_company[company].append(inv)
-    
-    # Print by company
+        by_company.setdefault(inv['company_ipo'], []).append(inv)
+
     for company, company_investors in by_company.items():
-        print(f"\n{'─' * 100}")
-        print(f"🏢  {company.upper()}")
-        print(f"{'─' * 100}")
-        print(f"Filing Date: {company_investors[0]['filing_date']}")
-        print(f"Total Investors Found: {len(company_investors)}\n")
-        
+        print(f'\n{"─" * 100}')
+        print(f'{company.upper()}')
+        print(f'{"─" * 100}')
+        print(f'Filing Date: {company_investors[0]["filing_date"]}')
+        print(f'Investors Found: {len(company_investors)}\n')
+
         for i, inv in enumerate(company_investors, 1):
-            print(f"{i}. {inv['investor_name']}")
-            print(f"   └─ Type: {inv['entity_type'].replace('_', ' ').title()}")
-            
+            crm_flag = '  [IN CRM]' if inv['in_crm'] else ''
+            print(f'{i}. {inv["investor_name"]}{crm_flag}')
+            print(f'   Type: {inv["entity_type"].replace("_", " ").title()}')
+
             details = []
-            if inv['ownership_pct']:
-                details.append(f"Ownership: {inv['ownership_pct']}%")
-            if inv['shares']:
-                details.append(f"Shares: {inv['shares']}")
+            if inv.get('ownership_pct'):
+                details.append(f'Ownership: {inv["ownership_pct"]}%')
+            if inv.get('shares'):
+                details.append(f'Shares: {inv["shares"]}')
             if details:
-                print(f"   └─ {' | '.join(details)}")
-            
-            if inv['foundation_contacts']:
-                print(f"   └─ Foundation Contacts: {inv['foundation_contacts']}")
-            
-            print(f"   └─ LinkedIn: {inv['linkedin_search_url']}")
+                print(f'   {" | ".join(details)}')
+
+            if inv['in_crm']:
+                if inv.get('crm_status'):
+                    print(f'   CRM Status: {inv["crm_status"]}')
+                if inv.get('crm_last_activity'):
+                    print(f'   Last Activity: {inv["crm_last_activity"]}')
+
+            if inv.get('foundation_contacts'):
+                print(f'   Foundation Contacts: {inv["foundation_contacts"]}')
+
+            print(f'   LinkedIn: {inv["linkedin_search_url"]}')
             print()
-    
-    # Summary stats
-    print("\n" + "=" * 100)
-    print("📊 WEEKLY SUMMARY")
-    print("=" * 100)
-    print(f"\nTotal IPO Filings: {len(by_company)}")
-    print(f"Total Investors Identified: {len(investors)}\n")
-    
-    print("Breakdown by Entity Type:")
-    entity_counts = {}
+
+    print('\n' + '=' * 100)
+    print('WEEKLY SUMMARY')
+    print('=' * 100)
+    print(f'\nTotal IPO Filings: {len(by_company)}')
+    print(f'Total Investors Identified: {len(investors)}')
+    print(f'Already in CRM: {sum(1 for i in investors if i["in_crm"])}')
+    print(f'New Prospects: {sum(1 for i in investors if not i["in_crm"])}\n')
+
+    print('Breakdown by Entity Type:')
+    entity_counts: dict[str, int] = {}
     for inv in investors:
-        entity_type = inv['entity_type']
-        entity_counts[entity_type] = entity_counts.get(entity_type, 0) + 1
-    
+        entity_counts[inv['entity_type']] = entity_counts.get(inv['entity_type'], 0) + 1
     for entity_type, count in sorted(entity_counts.items(), key=lambda x: x[1], reverse=True):
-        print(f"   • {entity_type.replace('_', ' ').title()}: {count}")
-    
-    print("\n" + "=" * 100)
-    print("✅ COPY THE ABOVE RESULTS AND SHARE WITH YOUR TEAM")
-    print("=" * 100)
-    print("\n\n")
+        print(f'   {entity_type.replace("_", " ").title()}: {count}')
+
+    print('\n' + '=' * 100)
 
 
 def main():
-    logger.info("=" * 60)
-    logger.info("Starting S-1 Prospector Weekly Run")
-    logger.info("=" * 60)
-    
-    # Configuration
+    logger.info('=' * 60)
+    logger.info('Starting S-1 Prospector Weekly Run')
+    logger.info('=' * 60)
+
     days_back = int(os.getenv('DAYS_BACK', 7))
-    enrich_foundations = os.getenv('ENRICH_FOUNDATIONS', 'true').lower() == 'true'
-    
-    # Step 1: Get recent S-1 filings
-    logger.info(f"\n📋 STEP 1: Fetching S-1 filings from the last {days_back} days...")
+    enrich_foundations = os.getenv('ENRICH_FOUNDATIONS', 'false').lower() == 'true'
+
+    # Step 1: EDGAR filings
+    logger.info(f'\nSTEP 1: Fetching S-1 filings from the last {days_back} days...')
     filings = get_recent_s1_filings(days_back=days_back)
-    logger.info(f"✓ Found {len(filings)} S-1 filings")
-    
+    logger.info(f'Found {len(filings)} S-1 filings')
+
     if not filings:
-        logger.warning("⚠️  No S-1 filings found in the specified time period")
-        logger.info("This might be normal during slow IPO periods")
+        logger.warning('No S-1 filings found in the specified time period')
         return []
-    
-    # Show which companies we found
-    logger.info("\nCompanies found:")
+
     for filing in filings:
-        logger.info(f"  • {filing['company_name']} (Filed: {filing['filing_date']})")
-    
-    # Step 2: Parse stockholders from each filing
-    logger.info(f"\n📊 STEP 2: Parsing stockholder tables...")
+        logger.info(f'  {filing["company_name"]} (Filed: {filing["filing_date"]})')
+
+    # Step 2: Parse stockholders
+    logger.info('\nSTEP 2: Parsing stockholder tables...')
     all_investors = []
-    
+
     for i, filing in enumerate(filings, 1):
-        logger.info(f"\n[{i}/{len(filings)}] Processing: {filing['company_name']}")
+        logger.info(f'[{i}/{len(filings)}] Processing: {filing["company_name"]}')
         stockholders = parse_stockholders(filing)
-        
+
         if stockholders:
-            logger.info(f"  ✓ Found {len(stockholders)} stockholders")
-            for stockholder in stockholders:
-                investor = {
-                    'investor_name': stockholder['name'],
-                    'company_ipo': filing['company_name'],
-                    'filing_date': filing['filing_date'],
-                    'ownership_pct': stockholder.get('ownership_pct', ''),
-                    'shares': stockholder.get('shares', ''),
-                    'entity_type': classify_entity(stockholder['name']),
-                    'in_crm': False,
-                    'crm_status': '',
-                    'crm_last_activity': '',
-                    'crm_notes': '',
-                    'foundation_contacts': '',
-                    'linkedin_search_url': generate_linkedin_search_url(stockholder['name'])
-                }
-                all_investors.append(investor)
+            logger.info(f'  Found {len(stockholders)} stockholders')
         else:
-            logger.warning(f"  ⚠️  No stockholders extracted from {filing['company_name']}")
-            logger.warning(f"     This filing may have an unusual table format")
-    
-    logger.info(f"\n✓ Total investor records extracted: {len(all_investors)}")
-    
+            logger.warning(f'  No stockholders extracted from {filing["company_name"]}')
+
+        for stockholder in stockholders:
+            all_investors.append({
+                'investor_name': stockholder['name'],
+                'company_ipo': filing['company_name'],
+                'filing_date': filing['filing_date'],
+                'ownership_pct': stockholder.get('ownership_pct', ''),
+                'shares': stockholder.get('shares', ''),
+                'entity_type': classify_entity(stockholder['name']),
+                'in_crm': False,
+                'crm_status': '',
+                'crm_last_activity': '',
+                'crm_notes': '',
+                'foundation_contacts': '',
+                'linkedin_search_url': generate_linkedin_search_url(stockholder['name']),
+            })
+
+    logger.info(f'\nTotal investor records extracted: {len(all_investors)}')
+
     if not all_investors:
-        logger.warning("⚠️  No investors extracted from any filings")
-        logger.warning("This could indicate parsing issues - check the filing formats manually")
+        logger.warning('No investors extracted from any filings')
         return []
-    
-    # Show entity breakdown
-    entity_counts = {}
-    for investor in all_investors:
-        entity_type = investor['entity_type']
-        entity_counts[entity_type] = entity_counts.get(entity_type, 0) + 1
-    
-    logger.info("\nEntity type breakdown:")
-    for entity_type, count in sorted(entity_counts.items(), key=lambda x: x[1], reverse=True):
-        logger.info(f"  • {entity_type}: {count}")
-    
-    # Step 3: Enrich foundations with 990 data (optional)
+
+    # Step 3: Affinity CRM matching
+    logger.info('\nSTEP 3: Matching against Affinity CRM...')
+    affinity_client = load_affinity_client()
+    all_investors = [enrich_with_crm(inv, affinity_client) for inv in all_investors]
+
+    crm_matches = sum(1 for i in all_investors if i['in_crm'])
+    logger.info(f'CRM matches found: {crm_matches} of {len(all_investors)}')
+
+    # Step 4: Foundation enrichment (off by default, limited API value)
     if enrich_foundations:
         foundations = [i for i in all_investors if i['entity_type'] == 'foundation']
         if foundations:
-            logger.info(f"\n🔍 STEP 3: Looking up foundation 990 data ({len(foundations)} foundations)...")
-            
-            for i, investor in enumerate(foundations, 1):
-                logger.info(f"  [{i}/{len(foundations)}] Looking up: {investor['investor_name']}")
-                officers = lookup_foundation_officers(investor['investor_name'])
-                
+            logger.info(f'\nSTEP 4: Foundation 990 lookup ({len(foundations)} foundations)...')
+            for inv in foundations:
+                officers = lookup_foundation_officers(inv['investor_name'])
                 if officers:
-                    contacts = '; '.join([f"{o['name']} ({o['title']})" for o in officers[:5]])
-                    investor['foundation_contacts'] = contacts
-                    logger.info(f"    ✓ Found contacts: {contacts[:100]}...")
-                else:
-                    logger.info(f"    - No 990 data found")
+                    contacts = '; '.join(
+                        [f'{o["name"]} ({o["title"]})' for o in officers[:5]]
+                    )
+                    inv['foundation_contacts'] = contacts
         else:
-            logger.info(f"\n⏭️  STEP 3: Skipped (no foundations found)")
+            logger.info('\nSTEP 4: Skipped (no foundations found)')
     else:
-        logger.info(f"\n⏭️  STEP 3: Foundation enrichment disabled")
-    
-    # Step 4: Print results to console FIRST (before CSV)
+        logger.info('\nSTEP 4: Foundation enrichment disabled (set ENRICH_FOUNDATIONS=true to enable)')
+
+    # Step 5: Print and save
     timestamp = datetime.now().strftime('%Y-%m-%d')
     print_results_to_console(all_investors, timestamp)
-    
-    # Step 5: Save CSV backup
-    logger.info(f"\n💾 STEP 5: Saving CSV backup...")
-    filename = f"s1_investors_{timestamp}.csv"
+
+    filename = f's1_investors_{timestamp}.csv'
     write_to_csv(all_investors, filename)
-    logger.info(f"✓ Saved to {filename}")
-    
-    # Final Summary
-    logger.info("\n" + "=" * 60)
-    logger.info("📈 RUN COMPLETE")
-    logger.info("=" * 60)
-    logger.info(f"S-1 Filings Processed: {len(filings)}")
-    logger.info(f"Total Investors Found: {len(all_investors)}")
-    logger.info(f"Foundations: {sum(1 for i in all_investors if i['entity_type'] == 'foundation')}")
-    logger.info(f"Family Offices: {sum(1 for i in all_investors if i['entity_type'] == 'family_office')}")
-    logger.info(f"Funds: {sum(1 for i in all_investors if i['entity_type'] == 'fund')}")
-    logger.info("=" * 60)
-    logger.info("\n🎯 Check the formatted report above to copy/paste to your team!")
-    logger.info("=" * 60)
-    
+    logger.info(f'Saved CSV to {filename}')
+
+    logger.info('\n' + '=' * 60)
+    logger.info('RUN COMPLETE')
+    logger.info(f'Filings Processed: {len(filings)}')
+    logger.info(f'Investors Found: {len(all_investors)}')
+    logger.info(f'In CRM: {sum(1 for i in all_investors if i["in_crm"])}')
+    logger.info(f'New Prospects: {sum(1 for i in all_investors if not i["in_crm"])}')
+    logger.info('=' * 60)
+
     return all_investors
 
 
@@ -240,6 +253,6 @@ if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        logger.info("\n\n⚠️  Run interrupted by user")
+        logger.info('Run interrupted by user')
     except Exception as e:
-        logger.error(f"\n\n❌ FATAL ERROR: {e}", exc_info=True)
+        logger.error(f'FATAL ERROR: {e}', exc_info=True)
