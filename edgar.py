@@ -28,15 +28,28 @@ EFTS_SEARCH_URL = 'https://efts.sec.gov/LATEST/search-index'
 
 def get_recent_s1_filings(days_back: int = 7) -> List[Dict]:
     """
-    Fetch S-1 and S-1/A filings from the last N days using the EFTS
-    full-text search API with explicit date range parameters.
-    Falls back to the RSS feed if EFTS returns nothing.
-    """
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=days_back)
+    Fetch S-1 and S-1/A filings.
 
-    start_str = start_date.strftime('%Y-%m-%d')
-    end_str = end_date.strftime('%Y-%m-%d')
+    Date range priority:
+      1. START_DATE / END_DATE env vars (explicit backfill range, format YYYY-MM-DD)
+      2. DAYS_BACK env var or days_back parameter (rolling window from today)
+
+    Set START_DATE and END_DATE in Railway for a one-off historical backfill,
+    then remove them to return to the normal weekly rolling window.
+    """
+    start_env = os.getenv('START_DATE', '').strip()
+    end_env = os.getenv('END_DATE', '').strip()
+
+    if start_env and end_env:
+        start_str = start_env
+        end_str = end_env
+        start_date = datetime.strptime(start_str, '%Y-%m-%d')
+        logger.info(f'Using explicit date range from env: {start_str} to {end_str}')
+    else:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days_back)
+        start_str = start_date.strftime('%Y-%m-%d')
+        end_str = end_date.strftime('%Y-%m-%d')
 
     filings = _fetch_via_efts(start_str, end_str)
     if not filings:
