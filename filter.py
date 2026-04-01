@@ -227,20 +227,36 @@ def get_company_description(filing: dict) -> str:
 
         # Look for "we are a", "the company is a", "X is a [descriptor] company"
         patterns = [
-            r'[Ww]e are (?:a |an )(.{20,180}?)[\.;]',
-            r'[Ww]e develop[^\.\n]{10,150}[\.;]',
-            r'[Ww]e design[^\.\n]{10,150}[\.;]',
-            r'[Ww]e provide[^\.\n]{10,150}[\.;]',
-            r'[Ww]e operate[^\.\n]{10,150}[\.;]',
-            r'[Ww]e build[^\.\n]{10,150}[\.;]',
-            r'[Ii]s a (?:leading |premier |pioneering )?(.{20,180}?)[\.;]',
+            r'[Ww]e are (?:a |an )(?!large|accelerated|smaller|emerging|non-).{20,200}?[.;]',
+            r'[Ww]e develop.{10,200}?[.;]',
+            r'[Ww]e design.{10,200}?[.;]',
+            r'[Ww]e provide.{10,200}?[.;]',
+            r'[Ww]e operate.{10,200}?[.;]',
+            r'[Ww]e build.{10,200}?[.;]',
+            r'[Ww]e offer.{10,200}?[.;]',
+            r'[Ww]e create.{10,200}?[.;]',
         ]
 
+        # SEC boilerplate to reject — these appear in every S-1 cover page
+        BOILERPLATE = re.compile(
+            r'(accelerated filer|smaller reporting company|emerging growth company'
+            r'|controlled company|check mark|indicate by check|annual report'
+            r'|commission file|exchange act|securities act)',
+            re.I
+        )
+
+        # Real business descriptions are in the Prospectus Summary,
+        # typically 5k-40k chars into the document. Search a broader window
+        # and reject any match that contains boilerplate language.
+        search_window = text[3000:50000]
+
         for pattern in patterns:
-            m = re.search(pattern, text[:8000])
-            if m:
+            for m in re.finditer(pattern, search_window):
                 desc = m.group(0).strip()
-                # Trim to ~120 chars max
+                if BOILERPLATE.search(desc):
+                    continue
+                if len(desc) < 40:
+                    continue
                 if len(desc) > 120:
                     desc = desc[:117] + '...'
                 return desc
