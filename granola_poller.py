@@ -19,13 +19,28 @@ logger = logging.getLogger(__name__)
 GRANOLA_API_BASE = "https://public-api.granola.ai/v1"
 STATE_FILE = Path("/tmp/granola_seen_notes.json")
 
-# Keywords that indicate an LP meeting vs an internal call
+# Keywords that indicate an LP meeting. Broad by design — better to over-include
+# and let Claude filter than to miss a real LP call.
 LP_TITLE_SIGNALS = [
     "lp", "investor", "limited partner", "family office", "endowment",
     "foundation", "pension", "fund of funds", "fof", "allocation",
     "capital call", "pitch", "fundraise", "fundraising", "close",
     "commitment", "diligence", "due diligence", "first meeting",
-    "intro call", "catch up", "check in", "follow up", "follow-up"
+    "intro call", "catch up", "check in", "follow up", "follow-up",
+    # Common meeting title patterns
+    "intro", "meeting", "call", "sync", "connect",
+    # Institution type signals
+    "management company", "investment", "capital", "ventures", "partners",
+    "asset management", "wealth", "trust", "university",
+    # Known LP name fragments — add specific names here as needed
+    "cameco", "wev", "moore", "ucea",
+]
+
+# Granola folder names that indicate LP fundraising content.
+# Notes in these folders are always processed regardless of title.
+LP_FOLDER_SIGNALS = [
+    "fundraising", "lp", "investors", "fund ii", "fund 2",
+    "limited partners", "capital raise",
 ]
 
 
@@ -63,12 +78,24 @@ class GranolaPoller:
 
     def _is_lp_meeting(self, note: Dict) -> bool:
         """
-        Heuristic filter: only process notes that look like LP meetings.
-        Checks the title for LP-related keywords. When in doubt, include it
-        so the Claude prompt can make the final call.
+        Return True if this note looks like an LP meeting.
+        Checks title keywords first, then folder membership.
         """
         title = (note.get("title") or "").lower()
-        return any(signal in title for signal in LP_TITLE_SIGNALS)
+
+        # Title keyword match
+        if any(signal in title for signal in LP_TITLE_SIGNALS):
+            return True
+
+        # Folder membership match
+        folders = note.get("folders", []) or []
+        for folder in folders:
+            folder_name = (folder.get("name") or "").lower()
+            if any(signal in folder_name for signal in LP_FOLDER_SIGNALS):
+                logger.info(f"Note matched via folder '{folder_name}': {note.get('title')}")
+                return True
+
+        return False
 
     def get_new_notes(self, lookback_hours: int = 4) -> List[Dict]:
         """
@@ -113,10 +140,10 @@ class GranolaPoller:
 
             if not self._is_lp_meeting(note):
                 logger.info(f"Skipping non-LP note: {note.get('title', 'untitled')}")
-                new_ids.add(note_id)  # mark seen so we don't re-evaluate
+                new_ids.add(note_id)
                 continue
 
-            # Fetch full note with transcript for context
+            # Fetch full note with transcript
             full_note = self._get(f"/notes/{note_id}?include=transcript")
             if full_note:
                 new_notes.append(full_note)
@@ -125,7 +152,6 @@ class GranolaPoller:
             else:
                 logger.warning(f"Could not fetch full note for {note_id}")
 
-        # Persist updated seen set
         self._save_seen_ids(seen_ids | new_ids)
 
         logger.info(f"Returning {len(new_notes)} new LP notes for processing")
@@ -134,8 +160,6 @@ class GranolaPoller:
     def extract_note_context(self, note: Dict) -> Dict:
         """
         Pull the fields the follow-up bot needs from a raw Granola note.
-        Returns a clean dict with: title, owner_email, owner_name,
-        summary, transcript_text, created_at.
         """
         owner = note.get("owner", {})
         owner_email = owner.get("email", "")
@@ -143,7 +167,6 @@ class GranolaPoller:
 
         summary = note.get("summary", "")
 
-        # Flatten transcript into readable text
         transcript_parts = []
         for segment in note.get("transcript", []):
             speaker_info = segment.get("speaker", {})
@@ -155,6 +178,9 @@ class GranolaPoller:
 
         transcript_text = "\n".join(transcript_parts)
 
+        folders = note.get("folders", []) or []
+        folder_names = [f.get("name", "") for f in folders if f.get("name")]
+
         return {
             "note_id": note.get("id"),
             "title": note.get("title", "Untitled meeting"),
@@ -163,4 +189,5 @@ class GranolaPoller:
             "summary": summary,
             "transcript_text": transcript_text,
             "created_at": note.get("created_at", ""),
+            "folders": folder_names,
         }
