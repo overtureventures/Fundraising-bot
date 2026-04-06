@@ -7,7 +7,6 @@ to #fundraising-bot on Slack, tagging the GP who had the call.
 """
 
 import os
-import re
 import logging
 import requests
 from typing import Dict, Optional
@@ -19,7 +18,6 @@ FUNDRAISING_BOT_CHANNEL = "C0AQHP58A0Z"
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 SLACK_API_URL = "https://slack.com/api"
 
-# ── Fundraising tactics context injected into every Claude prompt ────────────
 TACTICS_CONTEXT = """
 You are the fundraising intelligence system for Overture Ventures, a climate-focused
 early-stage venture fund raising Fund II.
@@ -30,74 +28,119 @@ MALTBY BUCKET CLASSIFICATION:
 - STRUCTURAL NO: notes contain "already in X funds" / "capacity issue" / "timing" / "I like you but..."
 
 FOLLOW-UP ACTION BY BUCKET:
-- REAL SHOT: Deal update or fund momentum email. Include specific next step (IC materials, reference
-  call, data room link). Cadence: every 2 to 3 days.
-- NEEDS WORK: "Show don't tell" email. Frame as "You mentioned X, here is a specific proof point."
+- REAL SHOT: Deal update or fund momentum email. Specific next step (IC materials, reference call,
+  data room link). Cadence: every 2 to 3 days.
+- NEEDS WORK: Show dont tell email. Frame as "You mentioned X, here is a specific proof point."
   Conclude with a proposed next meeting. Cadence: every 2 to 3 weeks.
-- STRUCTURAL NO: No-ask value-add only. No pitch reference. Goal is warmth for future fund cycle.
-  Cadence: quarterly.
+- STRUCTURAL NO: No ask value add only. No pitch reference. Cadence: quarterly.
 
 LP TYPE PERSONALIZATION:
-- Institutional (endowment, pension, foundation): Formal written comms. IC-ready materials.
-  Never pressure. Identify and support the internal champion.
-- Family office: Personal and direct. Text or personal email preferred. Co-invest access is high value.
-- HNWI: Personal conviction and relationship. Regular reciprocal gestures.
-- Fund of funds: Deep transparency. Proprietary sourcing proof. Differentiation is everything.
+- Institutional: Formal. IC ready materials. Never pressure.
+- Family office: Personal and direct. Text or personal email preferred.
+- HNWI: Personal conviction and relationship.
+- Fund of funds: Deep transparency. Differentiation is everything.
 
-WARM-UP RULE: Never make a capital ask without 2 to 3 value-add touchpoints first.
-If a capital ask seems premature based on the call notes, flag it.
+WARM UP RULE: Never make a capital ask without 2 to 3 value add touchpoints first.
 
-CADENCE:
-- Real Shot: every 2 to 3 days
-- Warm / Needs Work: every 2 to 3 weeks
-- Cool: monthly
-- Structural No: quarterly, value-add only
+OVERTURE PORTFOLIO FOR MATCHING:
+Use the LP's stated sector interests from the call notes to suggest a specific portfolio company
+touchpoint in the follow-up. Match on these:
 
-NEVER:
-- End a follow-up without a proposed next step
-- Send a generic check-in with no added value
-- Re-pitch. Add new evidence or new value only.
-- Make a capital ask without warming up first.
+ENERGY TRANSITION:
+- Antora: Thermal batteries cheaper than natural gas. Pre-IPO scale. Co-investors: Breakthrough Energy, Lowercarbon.
+- Blue Energy: Small modular nuclear power plants. 12x markup. Co-investors: At One, The Engine.
+- Hexium: Advanced nuclear fuels, accelerating uranium enrichment. Series A raising Q2/Q3.
+- Crux: Clean energy tax credit marketplace.
+- GridCARE: AI-powered grid capacity. Series A at $200M post-money, verbal term sheet.
+- Halcyon: AI platform for energy data. Series A closed at $92.5M post. Customers include Google, Meta, BlackRock, NextEra.
+- Bedrock Energy: Advanced geothermal heating and cooling. 1.46x markup.
+- Moment Energy: Used battery systems. Series B at $165M post, 2.17x markup.
+- Lydian: Sustainable Aviation Fuel. Series A led by Breakthrough Energy Ventures.
+- Recheck: Grid compliance and monitoring.
+- Blumen: Policy tech for energy funding.
+- Zero Homes: Home electrification. $17M Series A led by Prelude Ventures.
 
-OVERTURE FUND II CONTEXT:
-- Climate-focused early-stage venture (pre-seed and seed)
-- Thesis sectors: Energy Transition, Resilience, Industrial Transformation
-- Portfolio includes: Harbinger (EV trucks, potential IPO), Antora (thermal batteries),
-  Earth Force (US Forest Service default platform), Halcyon (AI energy data), Kerrigan
-  (robotic orchestration), Glacier (robotics recycling), BurnBot (wildfire prevention),
-  and 30+ others
-- Fund II target: institutional-grade raise, first close completed
+RESILIENCE:
+- BurnBot: Autonomous wildfire prevention robots. RX2 machines in field, $500K Cal Fire contract.
+- Earth Force: Software for US Forest Service vegetation management. Default USFS platform, $50M+ contracted.
+- Floodbase: Parametric flood insurance data.
+- Privateer: Geospatial intelligence platform. ~$40M revenue, 85% gross margins.
+- PHNX Materials: Critical minerals and metals. $5M DOE award.
+- LGND: Geospatial data for AI. Google contract.
+- Xage: Zero-trust cybersecurity. NVIDIA partnership.
+- BioSqueeze: Wellbore sealing technology for oil & gas.
+
+INDUSTRIAL TRANSFORMATION:
+- Harbinger: EV mid-duty trucks. Pre-IPO, $300M revenue, Goldman Sachs engaged for IPO.
+- Forum Mobility: Drayage trucking electrification. $75M Series B term sheet from CBRE.
+- Kerrigan: AI robotic orchestration platform. Customers: Tesla, Rivian, Applied Materials.
+- Molg: Robotics for AI data centers. $30M Series A at $92.5M post, 1.68x markup.
+- Glacier: AI-enabled robotics recycling. Direct investment from major public company incoming.
+- Alta: Domestic rare earth elements. 2.38x markup.
+- Endolith: Bio-mining for critical minerals. $13.5M Series A led by Squadra Ventures.
+- Graphyte: Carbon removal.
+- ChemFinity: Industrial separation technology.
+- Agrippa: Advanced maritime freight.
+- Brightfield: AI platform for commercial batteries. $100M+ pipeline, acquisition interest from hyperscaler.
+- Picarnot: Microgrid proposal and design automation. Co-investors: Sequoia, a16z Scouts.
+- Radify Metals: Cold-plasma reactor for rare earth metals.
+
+ACTIVELY RAISING NOW (highest priority touchpoints):
+- Hexium: Series A Q2/Q3 2026
+- Antora: Series C Q1 2026
+- Bedrock Energy: ~$15M Series A
+- Harbinger: $200M pre-IPO Series C extension
+
+FUND II CONTEXT:
+- Climate-focused pre-seed and seed
+- 2.55x MOIC / 51% net IRR on Fund I
+- First close completed on Fund II
+- Portfolio companies serving 22 of top 50 global companies
 """
 
 CLAUDE_SYSTEM_PROMPT = f"""{TACTICS_CONTEXT}
 
-Your job: Given a Granola meeting note from an LP call and the LP's CRM data, produce:
+Given a Granola meeting note from an LP call, produce a SHORT Slack brief.
 
-1. MALTBY BUCKET: One of REAL SHOT / NEEDS WORK / STRUCTURAL NO with a one-sentence reason.
+STEP 1: Check if the transcript has substantive content.
+If it contains fewer than 5 real exchanges or only introductions with no investment discussion,
+output only:
+*INCOMPLETE NOTE* — [one sentence on what was captured]
+*Action items*
+1. Verify full notes were saved in Granola
+[Add 1 to 2 obvious follow-ups if inferable from partial context]
+Then stop. No bucket, no follow-up message.
 
-2. ACTION ITEMS: A short numbered list of what the GP owes from this call. Be specific.
-   Reference exact things discussed in the notes. No vague items.
+STEP 2: For complete notes, mine the transcript and summary for:
+- Sectors or themes the LP mentioned interest in
+- Specific companies, deals, or investments they referenced
+- Books, articles, or resources mentioned in conversation
+- Objections or concerns raised
+- Co-investment interest
+- Any specific asks or commitments made
 
-3. SUGGESTED FOLLOW-UP MESSAGE: Write a draft message the GP can send within 24 hours.
-   Rules:
-   - Write like a senior partner, not a marketing tool
-   - Use the LP's name
-   - Reference something specific from the call
-   - Connect to a relevant portfolio company or thesis point if it fits naturally
-   - End with a clear, specific next step
-   - No hyphens anywhere
-   - No AI sounding openers or closers
-   - No "I hope this finds you well" or equivalent
-   - If LP is institutional, keep it formal. If family office or HNWI, keep it personal.
-   - If this is a STRUCTURAL NO, do not pitch. Offer a value add only.
+Then output exactly this format:
 
-4. FOLLOW-UP CADENCE: State the recommended next contact window based on the bucket.
+*[MALTBY BUCKET]* — [one sentence reason]
 
-Format your response with these exact section headers:
-MALTBY BUCKET
-ACTION ITEMS
-SUGGESTED FOLLOW-UP MESSAGE
-FOLLOW-UP CADENCE
+*Action items*
+1. [specific, referenced from the notes]
+2. [specific, referenced from the notes]
+(3 to 4 max)
+
+*Suggested follow-up*
+[3 to 5 sentences. Write like a senior GP. Use the LP's name. Reference something specific
+from the call. If they expressed interest in a sector, naturally weave in the most relevant
+portfolio company from the list above — do not force it if there is no match. If a book or
+resource was discussed, suggest sending it. End with one clear next step. No hyphens anywhere.
+No AI sounding language. No generic openers. If STRUCTURAL NO, value add only, no pitch.]
+
+Rules:
+- Entire output must be concise enough for a Slack message
+- No section headers beyond the three shown
+- No cadence section
+- No explanation of your reasoning beyond the bucket line
+- Never use hyphens
 """
 
 
@@ -109,16 +152,11 @@ class FollowUpBot:
         self.affinity_list_name = os.getenv("AFFINITY_LIST_NAME", "Fundraising")
         self._slack_user_cache: Dict[str, str] = {}
 
-    # ── Slack helpers ────────────────────────────────────────────────────────
-
     def _lookup_slack_user_id(self, email: str) -> Optional[str]:
-        """Resolve a Granola owner email to a Slack user ID for tagging."""
         if email in self._slack_user_cache:
             return self._slack_user_cache[email]
-
         if not self.slack_token:
             return None
-
         try:
             r = requests.get(
                 f"{SLACK_API_URL}/users.lookupByEmail",
@@ -142,7 +180,6 @@ class FollowUpBot:
         if not self.slack_token:
             logger.warning("SLACK_BOT_TOKEN not set. Skipping post.")
             return False
-
         try:
             r = requests.post(
                 f"{SLACK_API_URL}/chat.postMessage",
@@ -169,17 +206,10 @@ class FollowUpBot:
             logger.error(f"Slack post failed: {e}")
             return False
 
-    # ── Affinity lookup ──────────────────────────────────────────────────────
-
     def _get_lp_crm_data(self, lp_name: str) -> Dict:
-        """
-        Try to find the LP in Affinity and return pipeline context.
-        Returns an empty dict if Affinity is not configured or no match found.
-        """
         if not self.affinity_key:
             logger.info("AFFINITY_API_KEY not set. Skipping CRM lookup.")
             return {}
-
         try:
             client = AffinityClient(self.affinity_key)
             client.load_fundraising_list(self.affinity_list_name)
@@ -194,13 +224,10 @@ class FollowUpBot:
             logger.error(f"Affinity lookup failed for '{lp_name}': {e}")
             return {}
 
-    # ── Claude call ──────────────────────────────────────────────────────────
-
     def _call_claude(self, user_prompt: str) -> Optional[str]:
         if not self.anthropic_key:
             logger.error("ANTHROPIC_API_KEY not set.")
             return None
-
         try:
             r = requests.post(
                 ANTHROPIC_API_URL,
@@ -211,7 +238,7 @@ class FollowUpBot:
                 },
                 json={
                     "model": "claude-sonnet-4-20250514",
-                    "max_tokens": 1500,
+                    "max_tokens": 700,
                     "system": CLAUDE_SYSTEM_PROMPT,
                     "messages": [{"role": "user", "content": user_prompt}],
                 },
@@ -226,16 +253,7 @@ class FollowUpBot:
             logger.error(f"Claude API call failed: {e}")
             return None
 
-    # ── Main entry point ─────────────────────────────────────────────────────
-
     def process_note(self, note_context: Dict) -> bool:
-        """
-        Full pipeline for one note:
-        1. Extract LP name from meeting title
-        2. Look up LP in Affinity
-        3. Call Claude with all context
-        4. Post to Slack tagging the GP
-        """
         title = note_context.get("title", "Untitled meeting")
         owner_email = note_context.get("owner_email", "")
         owner_name = note_context.get("owner_name", "Unknown")
@@ -245,42 +263,26 @@ class FollowUpBot:
 
         logger.info(f"Processing note: '{title}' (owner: {owner_name})")
 
-        # Extract LP name from title (typically "LP Name <> Overture" or "Call with LP Name")
         lp_name = self._extract_lp_name(title)
-
-        # CRM lookup
         crm_data = self._get_lp_crm_data(lp_name) if lp_name else {}
+
         crm_context = ""
         if crm_data:
-            crm_context = f"""
-CRM DATA FOR THIS LP:
-- Organization: {crm_data.get('name', 'N/A')}
-- Pipeline status: {crm_data.get('status', 'Unknown')}
-- Last activity: {crm_data.get('last_activity', 'Unknown')}
-- Notes on file: {crm_data.get('notes', 'None')}
-"""
+            crm_context = (
+                f"\nCRM: {crm_data.get('name', 'N/A')} | "
+                f"Status: {crm_data.get('status', 'Unknown')} | "
+                f"Last activity: {crm_data.get('last_activity', 'Unknown')}"
+            )
 
-        # Build user prompt for Claude
-        user_prompt = f"""
-Meeting title: {title}
-Date: {created_at}
-GP on the call: {owner_name} ({owner_email})
+        user_prompt = (
+            f"Meeting: {title}\n"
+            f"Date: {created_at[:10] if created_at else 'unknown'}\n"
+            f"GP: {owner_name}\n"
+            f"{crm_context}\n\n"
+            f"SUMMARY:\n{summary}\n\n"
+            f"TRANSCRIPT:\n{transcript[:2500] if transcript else 'No transcript available.'}"
+        )
 
-MEETING SUMMARY FROM GRANOLA:
-{summary}
-
-TRANSCRIPT EXCERPT:
-{transcript[:3000] if transcript else "No transcript available."}
-
-{crm_context}
-
-LP NAME IDENTIFIED: {lp_name or "Could not identify from title"}
-
-Based on the above, provide the four sections: MALTBY BUCKET, ACTION ITEMS,
-SUGGESTED FOLLOW-UP MESSAGE, and FOLLOW-UP CADENCE.
-"""
-
-        # Call Claude
         logger.info("Calling Claude for follow-up analysis...")
         analysis = self._call_claude(user_prompt)
 
@@ -288,36 +290,22 @@ SUGGESTED FOLLOW-UP MESSAGE, and FOLLOW-UP CADENCE.
             logger.error("Claude returned no response. Skipping Slack post.")
             return False
 
-        # Build Slack message
         slack_user_id = self._lookup_slack_user_id(owner_email)
         gp_tag = f"<@{slack_user_id}>" if slack_user_id else owner_name
-
         lp_display = lp_name or title
         date_display = created_at[:10] if created_at else "today"
 
         slack_message = (
-            f"*Follow-Up Brief: {lp_display}* | {date_display}\n"
-            f"Call owner: {gp_tag}\n"
-            f"{'─' * 48}\n"
+            f"*{lp_display}* | {date_display} | {gp_tag}\n"
+            f"{'─' * 40}\n"
             f"{analysis}"
         )
 
         return self._post_to_slack(slack_message)
 
-    # ── LP name extraction ───────────────────────────────────────────────────
-
     def _extract_lp_name(self, title: str) -> Optional[str]:
-        """
-        Parse meeting title to extract the LP or organization name.
-        Handles common formats:
-          "BlackRock <> Overture"
-          "Call with Wellcome Trust"
-          "Overture / Stanford Endowment"
-          "First meeting: Harvard Management Company"
-        """
         title_clean = title.strip()
 
-        # Pattern: X <> Y or X / Y or X | Y  — return the non-Overture side
         for sep in [" <> ", " / ", " | ", " — ", " - "]:
             if sep in title_clean:
                 parts = title_clean.split(sep, 1)
@@ -327,7 +315,6 @@ SUGGESTED FOLLOW-UP MESSAGE, and FOLLOW-UP CADENCE.
                         return part
                 return parts[0].strip()
 
-        # Pattern: "Call with X" / "Intro with X" / "Meeting with X"
         prefixes = [
             "call with ", "intro with ", "intro call with ",
             "meeting with ", "first meeting with ", "first meeting:",
@@ -339,12 +326,9 @@ SUGGESTED FOLLOW-UP MESSAGE, and FOLLOW-UP CADENCE.
             if title_lower.startswith(prefix):
                 return title_clean[len(prefix):].strip().rstrip(":")
 
-        # Pattern: "X: follow up" or "X: intro" — take the first segment
         if ":" in title_clean:
             candidate = title_clean.split(":")[0].strip()
             if len(candidate) > 3 and "overture" not in candidate.lower():
                 return candidate
 
-        # Fallback: return full title as the LP identifier so Affinity can attempt a match
-        logger.info(f"Could not parse LP name from title '{title}'. Using full title for CRM lookup.")
         return title_clean
