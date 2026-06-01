@@ -12,8 +12,8 @@ builder = "NIXPACKS"
 [deploy]
 startCommand = "python main.py"
 
-# TEMPORARY TEST SCHEDULE: fires once at 21:42 UTC (2:42pm PT) today.
-# Revert to "0 9 * * 3" once the test run posts to #fundraising-bot.
-cronSchedule = "42 21 * * *"
+# TEMPORARY TEST SCHEDULE: fires once at 22:56 UTC (3:56pm PT) today.
+# Revert to "0 9 * * 3" once you've confirmed the run.
+cronSchedule = "56 22 * * *"
 
 restartPolicyType = "NEVER"
