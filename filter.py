@@ -125,11 +125,35 @@ INSTITUTIONAL_INDICATORS = re.compile(
     re.I
 )
 
+# Aggregated-holder phrasing that denotes an institution even with no legal
+# suffix, e.g. "Entities affiliated with Silver Lake", "Affiliates of Soros".
+INSTITUTIONAL_PHRASE = re.compile(
+    r'\baffiliated\s+with\b|\bassociated\s+with\b|^\s*affiliates?\s+of\b'
+    r'|^\s*entities?\b|^\s*funds?\s+(affiliated|managed|advised)\b',
+    re.I
+)
+
+# Well-known managers/firms that lack a legal-suffix keyword in common usage.
+# Extend this list as you see misclassified names in the weekly output.
+KNOWN_INSTITUTIONS = [
+    'general atlantic', 'silver lake', 'tiger global', 'coatue', 'dragoneer',
+    'sequoia', 'andreessen', 'thoma bravo', 'vista equity', 'warburg pincus',
+    'kkr', 'blackstone', 'carlyle', 'bain', 'tpg', 'insight', 'greenoaks',
+    'altimeter', 'lightspeed', 'battery', 'soros', 'iconiq', 'dst global',
+    'temasek', 'mubadala', 'fidelity', 'wellington', 't. rowe', 'baillie gifford',
+    'd1 capital', 'whale rock', 'dragoneer',
+]
+
 def classify_investor(name: str) -> str:
     """
     Return 'institutional' if the name looks like a fund/entity,
     'individual' if it looks like a person's name.
     """
+    name_lower = name.lower()
+    if INSTITUTIONAL_PHRASE.search(name):
+        return 'institutional'
+    if any(k in name_lower for k in KNOWN_INSTITUTIONS):
+        return 'institutional'
     if INSTITUTIONAL_INDICATORS.search(name):
         return 'institutional'
     # Looks like a person: 2-4 words, each starting with a capital
