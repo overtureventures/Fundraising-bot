@@ -314,6 +314,26 @@ def is_valid_investor_name(name: str) -> bool:
     if name == name_upper and len(words) >= 3:
         return False
 
+    # Table captions and subtotal/group-row labels that masquerade as the
+    # first cell of a row. A real investor name never ends in a colon and never
+    # contains these ownership-table caption phrases.
+    if name.rstrip().endswith(':'):
+        return False
+    caption_rejects = [
+        'greater than', 'more than', 'less than', 'percent holder',
+        'percent stockholder', 'five percent', '5% stockholder', '5% holder',
+        '5% or greater', 'beneficial owner', 'beneficial ownership',
+        'name of beneficial', 'selling stockholder', 'selling securityholder',
+        'selling shareholder', 'principal stockholder', 'principal shareholder',
+        'named executive officer', 'material changes', 'security ownership',
+        'shares beneficially owned', 'number of shares', 'amount and nature',
+        'directors and officers', 'officers and directors', 'all directors',
+        'all executive officers', 'all officers', 'all named',
+    ]
+    for cap in caption_rejects:
+        if cap in name_lower:
+            return False
+
     exact_rejects = [
         'directors and executive officers',
         'executive officers and directors',
@@ -399,6 +419,11 @@ def is_valid_investor_name(name: str) -> bool:
     ]
     has_entity_indicator = any(ind in name_lower for ind in entity_indicators)
 
+    # All-caps strings with no entity keyword are headers like "MATERIAL CHANGES",
+    # not investor names. (Real all-caps entities carry a suffix like "LLC".)
+    if name == name_upper and not has_entity_indicator:
+        return False
+
     capitalized_words = sum(1 for w in words if w and w[0].isupper() and not w.isupper())
     looks_like_person = 2 <= len(words) <= 5 and capitalized_words >= 2 and name != name_upper
 
@@ -411,7 +436,7 @@ def is_valid_investor_name(name: str) -> bool:
     if has_entity_indicator or looks_like_person or has_credentials:
         return True
 
-    if 2 <= len(words) <= 4 and all(w[0].isupper() for w in words if w):
+    if 2 <= len(words) <= 4 and name != name_upper and all(w[0].isupper() for w in words if w):
         return True
 
     return False
@@ -437,7 +462,7 @@ def extract_stockholder_table(soup: BeautifulSoup) -> List[Dict]:
         table_text = table.get_text().lower()
         preceding_text = ''
 
-        for prev in table.find_all_previous(limit=5):
+        for prev in table.find_all_previous(limit=10):
             if prev.name in ['h1', 'h2', 'h3', 'h4', 'p', 'div', 'b', 'strong']:
                 preceding_text = prev.get_text().lower()
                 break
@@ -448,7 +473,12 @@ def extract_stockholder_table(soup: BeautifulSoup) -> List[Dict]:
                 is_stockholder_table = True
                 break
 
-        if 'beneficial' in table_text and ('shares' in table_text or 'percent' in table_text):
+        # "beneficial" is specific enough to ownership tables on its own.
+        # Also accept tables that pair an ownership column with a name column.
+        if 'beneficial' in table_text:
+            is_stockholder_table = True
+        elif 'name' in table_text and ('shares' in table_text or 'percent' in table_text
+                                       or '%' in table_text):
             is_stockholder_table = True
 
         if not is_stockholder_table:
@@ -456,15 +486,26 @@ def extract_stockholder_table(soup: BeautifulSoup) -> List[Dict]:
 
         rows = table.find_all('tr')
         header_row_idx = None
-        for idx, row in enumerate(rows):
+        combined = ''
+        # Headers in large filings often span multiple rows (colspan) and use
+        # "%" rather than the word "percent". Detect across the first few rows.
+        for idx, row in enumerate(rows[:6]):
             row_text = row.get_text().lower()
-            if ('name' in row_text and ('shares' in row_text or 'percent' in row_text)) or \
-               ('beneficial owner' in row_text):
+            combined += ' ' + row_text
+            single = (('name' in row_text and ('shares' in row_text or 'percent' in row_text
+                                               or '%' in row_text))
+                      or 'beneficial owner' in row_text)
+            multi = (('name' in combined or 'beneficial owner' in combined)
+                     and ('shares' in combined or 'percent' in combined or '%' in combined))
+            if single or multi:
                 header_row_idx = idx
                 break
 
+        # Flagged as a stockholder table but no header row matched (unusual
+        # split/colspan layout). Parse from the top anyway; is_valid_investor_name()
+        # filters out caption and subtotal rows.
         if header_row_idx is None:
-            continue
+            header_row_idx = 0
 
         for row in rows[header_row_idx + 1:]:
             cells = row.find_all(['td', 'th'])
