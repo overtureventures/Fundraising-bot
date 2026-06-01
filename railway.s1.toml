@@ -12,10 +12,8 @@ builder = "NIXPACKS"
 [deploy]
 startCommand = "python main.py"
 
-# Wednesdays at 09:00 UTC. Railway evaluates cron in UTC.
-# 09:00 UTC == 02:00 America/Los_Angeles (PDT).
-# If you want it to land at 9am Pacific instead, use "0 16 * * 3".
-cronSchedule = "0 9 * * 3"
+# TEMPORARY TEST SCHEDULE: fires once at 21:42 UTC (2:42pm PT) today.
+# Revert to "0 9 * * 3" once the test run posts to #fundraising-bot.
+cronSchedule = "42 21 * * *"
 
-# Don't auto-restart a finished run; just wait for the next scheduled trigger.
 restartPolicyType = "NEVER"
