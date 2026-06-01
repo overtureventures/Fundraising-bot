@@ -1,6 +1,6 @@
 # Railway config for the WEEKLY S-1 scraper service.
 #
-# In Railway: create/select the S-1 service, then set
+# In Railway: select the S-1 service, then set
 #   Settings -> Config-as-code -> Config File Path:  /railway.s1.toml
 #
 # Railway runs `startCommand` on the cron schedule, then the process exits.
@@ -12,8 +12,10 @@ builder = "NIXPACKS"
 [deploy]
 startCommand = "python main.py"
 
-# TEMPORARY TEST SCHEDULE: fires once at 22:56 UTC (3:56pm PT) today.
-# Revert to "0 9 * * 3" once you've confirmed the run.
-cronSchedule = "56 22 * * *"
+# Wednesdays at 09:00 UTC (= 02:00 America/Los_Angeles, PDT).
+# Railway evaluates cron in UTC. For 9am Pacific instead, use "0 16 * * 3".
+# To run a one-off test, temporarily set this to a few minutes ahead in UTC,
+# then revert to this line.
+cronSchedule = "0 9 * * 3"
 
 restartPolicyType = "NEVER"
