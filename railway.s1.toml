@@ -1,0 +1,21 @@
+# Railway config for the WEEKLY S-1 scraper service.
+#
+# In Railway: create/select the S-1 service, then set
+#   Settings -> Config-as-code -> Config File Path:  /railway.s1.toml
+#
+# Railway runs `startCommand` on the cron schedule, then the process exits.
+# For a cron service, a clean exit is the intended outcome -- not a crash.
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python main.py"
+
+# Wednesdays at 09:00 UTC. Railway evaluates cron in UTC.
+# 09:00 UTC == 02:00 America/Los_Angeles (PDT).
+# If you want it to land at 9am Pacific instead, use "0 16 * * 3".
+cronSchedule = "0 9 * * 3"
+
+# Don't auto-restart a finished run; just wait for the next scheduled trigger.
+restartPolicyType = "NEVER"

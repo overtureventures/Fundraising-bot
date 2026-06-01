@@ -1,0 +1,19 @@
+# Railway config for the LP FOLLOW-UP bot service.
+#
+# In Railway: create a SECOND service from this same repo, then set
+#   Settings -> Config-as-code -> Config File Path:  /railway.followup.toml
+#
+# Polls Granola for new LP meeting notes, posts briefs to #fundraising-bot,
+# then exits. Runs on a schedule -- it is not a long-running process.
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python run_followup_bot.py"
+
+# Every 30 min, 15:00-23:30 UTC, Mon-Fri (~08:00-16:30 Pacific).
+# Adjust the hour range (in UTC) to your real business hours.
+cronSchedule = "*/30 15-23 * * 1-5"
+
+restartPolicyType = "NEVER"
